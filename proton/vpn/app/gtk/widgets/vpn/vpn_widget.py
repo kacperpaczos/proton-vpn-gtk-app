@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 # The feature flag that enables the lazy loading serverlist UI
 LINUX_DEFERRED_UI = "LinuxDeferredUI"
 
+# PERF diagnostic: main loop watchdog settings. If the (single-threaded)
+# main loop takes more than 250ms to run a 100ms timer, the UI thread was
+# blocked by something and the stall is logged.
+MAIN_LOOP_WATCHDOG_INTERVAL_MS = 100
+MAIN_LOOP_WATCHDOG_STALL_THRESHOLD_MS = 250
+
 
 @dataclass
 class VPNWidgetState:
@@ -79,6 +85,10 @@ class VPNWidget(Gtk.Box):
         self._state = VPNWidgetState()
         self._state.load_start_time = time.time()
         self._controller = controller
+
+        # PERF diagnostic: watches the main loop for stalls (see display()).
+        self._watchdog_source_id: Optional[int] = None
+        self._watchdog_last_tick: float = 0.0
 
         self.connection_status_widget = VPNConnectionStatusWidget(
             controller, notifications
@@ -196,6 +206,38 @@ class VPNWidget(Gtk.Box):
 
         self.server_list_widget.display(user_tier=user_tier, server_list=server_list)
 
+        self._start_main_loop_watchdog()
+
+    def _start_main_loop_watchdog(self):
+        """PERF diagnostic: schedules a 100ms timer on the main loop. The main
+        loop is single-threaded, so whenever this timer fires later than
+        ~250ms after the previous tick, something blocked the UI thread. The
+        stall is logged with its duration and can be correlated with the
+        PERF logs emitted by the server list widget to attribute freezes
+        either to search filtering or to network data updates."""
+        if self._watchdog_source_id is not None:
+            return
+        self._watchdog_last_tick = time.monotonic()
+        self._watchdog_source_id = GLib.timeout_add(
+            MAIN_LOOP_WATCHDOG_INTERVAL_MS, self._on_main_loop_watchdog_tick
+        )
+
+    def _stop_main_loop_watchdog(self):
+        if self._watchdog_source_id is not None:
+            GLib.source_remove(self._watchdog_source_id)
+            self._watchdog_source_id = None
+
+    def _on_main_loop_watchdog_tick(self) -> bool:
+        now = time.monotonic()
+        elapsed_ms = (now - self._watchdog_last_tick) * 1000
+        self._watchdog_last_tick = now
+        if elapsed_ms > MAIN_LOOP_WATCHDOG_STALL_THRESHOLD_MS:
+            logger.warning(
+                f"PERF main loop stalled: {elapsed_ms:.0f}ms passed since the "
+                f"previous tick (expected ~{MAIN_LOOP_WATCHDOG_INTERVAL_MS}ms)."
+            )
+        return GLib.SOURCE_CONTINUE
+
     def _on_server_list_updated(self, *_):
         if not self._state.is_widget_ready:  # noqa: E501 # pylint: disable=line-too-long # nosemgrep: python.lang.maintainability.is-function-without-parentheses.is-function-without-parentheses
             # Only update the status at this point as widgets are already generated
@@ -210,6 +252,7 @@ class VPNWidget(Gtk.Box):
 
     def unload(self):
         """Unloads the widget and resets its state."""
+        self._stop_main_loop_watchdog()
         for signal_id, widget in self._connected_signals:
             widget.disconnect(signal_id)
         self._connected_signals.clear()

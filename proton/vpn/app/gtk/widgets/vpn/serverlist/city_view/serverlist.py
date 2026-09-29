@@ -94,6 +94,7 @@ class ServerListWidget(Gtk.ScrolledWindow):
         self._pending_refresh = False
         self._pending_refresh_description = ""
         self._refresh_source_id: Optional[int] = None
+        self._refresh_queued_at: Optional[float] = None
 
     def display(self, user_tier: int, server_list: ServerList):
         """Builds and displays the server list."""
@@ -118,6 +119,8 @@ class ServerListWidget(Gtk.ScrolledWindow):
         The rows expanded before filtering are restored when the search text
         is cleared.
         """
+        # PERF: measure how much UI-thread time each keystroke costs.
+        start = time.perf_counter()
         needle = fold(search_text.strip())
         if not needle:
             self._clear_filter()
@@ -132,6 +135,10 @@ class ServerListWidget(Gtk.ScrolledWindow):
         for row in self.country_rows:
             row.filter(needle)
         self._active_filter = needle
+        logger.info(
+            f"PERF filter '{search_text}' applied in "
+            f"{time.perf_counter() - start:.3f}s over {len(self._country_rows)} country rows."
+        )
 
     def _expanded_groups_of(self, row: CountryRow) -> set[str]:
         """Returns the lowercase labels of the row's currently expanded groups."""
@@ -143,6 +150,9 @@ class ServerListWidget(Gtk.ScrolledWindow):
     def _clear_filter(self):
         """Clears the filter, making every row visible again and restoring
         the expansion state from before the filter was applied."""
+        # PERF: clearing (deleting the last char) is the heaviest keystroke:
+        # every row becomes visible again.
+        start = time.perf_counter()
         self._active_filter = None
         snapshot = self._filter_snapshot
         self._filter_snapshot = None
@@ -160,6 +170,9 @@ class ServerListWidget(Gtk.ScrolledWindow):
 
         if self._pending_refresh:
             self._schedule_refresh()
+        logger.info(
+            f"PERF filter cleared in {time.perf_counter() - start:.3f}s."
+        )
 
     def _populate_countries(self, server_list: ServerList):
         self._display_country_rows(server_list)
@@ -225,6 +238,7 @@ class ServerListWidget(Gtk.ScrolledWindow):
 
     def _on_server_list_update(self):
         """Whenever a new server list is received the UI should be updated."""
+        logger.info("PERF server list update received (network data update).")
         self._queue_refresh("Full server list widget update")
 
     def _on_server_loads_update(self):
@@ -236,6 +250,8 @@ class ServerListWidget(Gtk.ScrolledWindow):
         have nothing to update and rows hidden by an active filter keep their
         visibility. No rebuild, and no "ui-updated".
         """
+        # PERF: arrival timestamp on the UI thread, to correlate with stalls.
+        logger.info("PERF server loads update received (network data update).")
         start = time.time()
         needs_rebuild = False
         for country_row in self._country_rows:
@@ -252,6 +268,7 @@ class ServerListWidget(Gtk.ScrolledWindow):
 
     def _on_location_names_update(self):
         """Whenever refreshed location (city/state) names arrive the UI should be updated."""
+        logger.info("PERF location names update received (network data update).")
         self._queue_refresh("Location names widget update")
 
     def _queue_refresh(self, description: str):
@@ -267,6 +284,7 @@ class ServerListWidget(Gtk.ScrolledWindow):
         """
         self._pending_refresh = True
         self._pending_refresh_description = description
+        self._refresh_queued_at = time.perf_counter()
         if self._active_filter:
             logger.info(f"{description} deferred while a filter is active.")
         self._schedule_refresh()
@@ -285,6 +303,10 @@ class ServerListWidget(Gtk.ScrolledWindow):
         if self._active_filter or not self._pending_refresh:
             # Still searching: stay queued. _clear_filter() schedules the
             # rebuild again once the filter is cleared.
+            if self._active_filter and self._pending_refresh:
+                logger.info(
+                    "PERF queued rebuild held back by the active filter."
+                )
             return GLib.SOURCE_REMOVE
         self._pending_refresh = False
         self._display_server_list(self._pending_refresh_description)
@@ -294,7 +316,9 @@ class ServerListWidget(Gtk.ScrolledWindow):
         start = time.time()
         self.display(self._user_tier, self._controller.server_list)
         logger.info(
-            f"{description} completed in {time.time() - start:.2f} seconds."
+            f"PERF {description} completed in {time.time() - start:.2f} seconds "
+            f"(ran {time.perf_counter() - self._refresh_queued_at:.3f}s after "
+            f"the data update was queued)."
         )
 
     def unload(self):
@@ -312,13 +336,26 @@ class ServerListWidget(Gtk.ScrolledWindow):
 def _on_activate(app):
     server_list_widget = ServerListWidget(controller=Mock(spec=Controller))
 
+    # PERF diagnostic: search entry wired to the filter, so the standalone
+    # window doubles as a network-free A/B test: any jank while typing here
+    # cannot be caused by network data updates (they never arrive).
+    from proton.vpn.app.gtk.widgets.vpn.search_entry import SearchEntry
+    search_entry = SearchEntry()
+    safe_signal_connect(
+        search_entry, "search-changed",
+        lambda entry: server_list_widget.filter(entry.get_text())
+    )
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    box.append(search_entry)
+    box.append(server_list_widget)
+
     win = Gtk.ApplicationWindow(application=app)
     win.set_default_size(400, 600)
-    win.set_title("Server List")
+    win.set_title("Server List (offline demo)")
     win.get_settings().props.gtk_application_prefer_dark_theme = True
-    win.set_child(server_list_widget)
+    win.set_child(box)
     _load_cached_server_list(server_list_widget)
-    GLib.timeout_add_seconds(5, _load_cached_server_list, server_list_widget)
     win.present()
 
 
