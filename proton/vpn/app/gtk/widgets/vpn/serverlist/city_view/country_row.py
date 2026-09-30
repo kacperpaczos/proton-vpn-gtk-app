@@ -22,7 +22,10 @@ along with ProtonVPN.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import time
 from typing import List, Optional
+
+from proton.vpn import logging as proton_logging
 
 from proton.vpn.session.servers import Country, Location, TierEnum
 from proton.vpn.app.gtk import Gtk
@@ -42,6 +45,8 @@ from proton.vpn.app.gtk.widgets.vpn.serverlist.city_view.utils import \
 from proton.vpn.app.gtk.widgets.vpn.serverlist.city_view.secure_core_row import SecureCoreRow
 from proton.vpn.app.gtk.widgets.vpn.serverlist.icons import CountryFlagIcon
 from proton.vpn.app.gtk.utils.country import get_localized_country_name
+
+logger = proton_logging.getLogger(__name__)  # PERF (debug build)
 
 
 # pylint: disable=too-many-instance-attributes
@@ -301,8 +306,11 @@ class CountryRow(Gtk.Box):
         if not needle:
             return
 
+        _t0 = time.monotonic()  # PERF (debug build)
         name_match = self._name_matches(needle)
-        self.set_visible(name_match or self._children_match(needle))
+        children_match = self._children_match(needle)
+        self.set_visible(name_match or children_match)
+        _t_match = time.monotonic()
         if not self.get_visible():
             if self.expanded:
                 # Free the lazily built children: rows that no longer match
@@ -319,12 +327,21 @@ class CountryRow(Gtk.Box):
 
         if not self.expanded:
             self._expandable_row.set_expanded_now(True)
+        _t_expand = time.monotonic()
 
         for location_row in self.location_rows:
             location_row.filter(needle)
 
         if self._secure_core_row is not None:
             self._secure_core_row.filter(needle)
+        _t_children = time.monotonic()
+        if _t_children - _t0 > 0.05:
+            logger.info(
+                f"PERF CountryRow '{self.country_name}' filter: "
+                f"match={_t_match - _t0:.3f}s expand={_t_expand - _t_match:.3f}s "
+                f"children={_t_children - _t_expand:.3f}s "
+                f"total={_t_children - _t0:.3f}s"
+            )
 
     def update_server_loads(self) -> bool:
         """Updates the load displayed by every built server row under this

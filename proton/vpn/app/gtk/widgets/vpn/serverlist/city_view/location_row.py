@@ -22,6 +22,7 @@ along with ProtonVPN.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
 from gi.repository import GLib
@@ -201,6 +202,7 @@ class LocationRow(Gtk.Box):
         if not needle or self._location is None:
             return
 
+        _t0 = time.monotonic()  # PERF (debug build)
         servers = self._servers_to_display()
         name_match = bool(self._location.name) and needle in fold(self._location.name)
         matching_server_names = {
@@ -213,10 +215,21 @@ class LocationRow(Gtk.Box):
 
         if matching_server_names and not name_match and not self.expanded:
             self._expandable_row.set_expanded_now(True)
+        _t_expand = time.monotonic()
 
         # Server rows map 1:1 (by position) to the servers displayed.
-        for server_row, server in zip(self.server_rows, servers):
+        server_rows = self.server_rows
+        _t_build = time.monotonic()
+        for server_row, server in zip(server_rows, servers):
             server_row.set_visible(name_match or server.name in matching_server_names)
+        _t_loop = time.monotonic()
+        if _t_loop - _t0 > 0.05:
+            logger.info(
+                f"PERF LocationRow '{self.label}' filter: "
+                f"expand={_t_expand - _t0:.3f}s build_rows={_t_build - _t_expand:.3f}s "
+                f"loop={_t_loop - _t_build:.3f}s total={_t_loop - _t0:.3f}s "
+                f"({len(matching_server_names)}/{len(servers)} servers match)"
+            )
 
     def update_server_loads(self) -> bool:
         """Updates the load displayed by each of this row's built server rows,
